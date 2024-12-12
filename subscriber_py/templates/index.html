@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nummerplader fundet</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <h1>Nummerplader fundet</h1>
+    <table>
+        <tr>
+            <th>ID</th>
+            <th>Nummerplade</th>
+            <th>Tidspunkt</th>
+        </tr>
+        {% for plate in plates %}
+        <tr>
+            <td>{{ plate.id }}</td>
+            <td><span class="plate">{{ plate.plate }}</span></td>
+            <td>{{ plate.timestamp }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+</body>
+</html>
