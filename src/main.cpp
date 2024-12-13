@@ -31,7 +31,7 @@ const unsigned long debounceDelay = 5000; // 5 seconds
 // Last motion time
 #define INACTIVITY_TIMEOUT 30000 // 30 sekunder i millisekunder
 unsigned long lastMotionTime = 0;
-
+unsigned long lastMQTTRetryTime = 0;
 
 // Web server on port 80
 AsyncWebServer server(80);
@@ -66,6 +66,7 @@ void reconnectMQTT();
 void goToSleep();
 void sendSavedData();
 void appendFile(fs::FS &fs, const char *path, const char *message);
+void handleMQTTConnectionStatus();
 
 
 volatile bool motionDetected = false;
@@ -74,19 +75,6 @@ volatile bool motionDetected = false;
 void setup() {
     Serial.begin(115200);
     Serial.println("Starter ESP32...");
-
-    esp_sleep_wakeup_cause_t wakeupReason = esp_sleep_get_wakeup_cause();
-    switch (wakeupReason) {
-        case ESP_SLEEP_WAKEUP_EXT0:
-            Serial.println("Wakeup reason: GPIO (motion sensor)");
-            break;
-        case ESP_SLEEP_WAKEUP_TIMER:
-            Serial.println("Wakeup reason: Timer");
-            break;
-        default:
-            Serial.printf("Wakeup reason: %d\n", wakeupReason);
-            break;
-    }
 
     initLittleFS();
 
@@ -127,26 +115,31 @@ void loop() {
         goToSleep();
     }
 
-    if (!mqttClient.connected()) {
+    if (mqttNotActive && (millis() - lastMQTTRetryTime) > 60000) {
         reconnectMQTT();
-
-        if (mqttNotActive) {
-            Serial.println("MQTT er ikke aktiv fra loop");
-            return;
-        }
-        else {
-            Serial.println("MQTT er aktiv fra loop");
-            // Send saved data to MQTT
-            sendSavedData();
-            mqttClient.loop();
-        }
+        handleMQTTConnectionStatus();
+    }
+    else if (!mqttClient.connected()) {
+        reconnectMQTT();
+        handleMQTTConnectionStatus();
     }
 
     int sensorValue = digitalRead(SENSOR1_PIN);
     digitalWrite(LED_PIN, sensorValue ? LOW : HIGH);
 
-
     delay(100);
+}
+
+void  handleMQTTConnectionStatus() {
+    if (mqttNotActive) {
+        Serial.println("MQTT er ikke aktiv fra loop");
+    }
+    else {
+        Serial.println("MQTT er aktiv fra loop");
+        // Send saved data to MQTT
+        sendSavedData();
+        mqttClient.loop();
+    }
 }
 
 void IRAM_ATTR handleMotionSensor1() {
@@ -203,11 +196,11 @@ bool queryPlateScanner(String &plate, String &timestamp) {
 }
 
 void sendToMQTT(const String &plate, const String &timestamp) {
-    String message = "{\"plate\":\"" + plate + "\",\"timestamp\":\"" + timestamp + "\"}\n";
+    String message = "{\"plate\":\"" + plate + "\",\"timestamp\":\"" + timestamp + "\"}";
 
     if (mqttNotActive) {
+        appendFile(LittleFS, dataPath, message.c_str() + String("\n"));
         Serial.println("MQTT er ikke aktiv. Data gemt lokalt.");
-        appendFile(LittleFS, dataPath, message.c_str());
         return;
     }
 
@@ -220,12 +213,14 @@ void sendToMQTT(const String &plate, const String &timestamp) {
 
 void reconnectMQTT() {
     int retries = 0;
+    lastMQTTRetryTime = millis();
+
     while (!mqttClient.connected()) {
         Serial.print("Forbinder til MQTT-broker...");
-        if (mqttClient.connect(mqtt_client_id)) { // Skift evt. client-id
+        if (mqttClient.connect(mqtt_client_id)) {
             Serial.println("Forbundet til MQTT!");
-            mqttNotActive = false; // Marker som aktiv, hvis vi opretter forbindelse
-            return; // Forlad funktionen, da vi er forbundet
+            mqttNotActive = false;
+            return; 
         } else {
             Serial.print("Fejl under forbindelse til MQTT-broker\nFejl (kode: ");
             Serial.print(mqttClient.state());
@@ -234,7 +229,7 @@ void reconnectMQTT() {
             if (retries > 3) {
                 mqttNotActive = true;
                 Serial.println("MQTT connection fejlede. Vi prøvede 3 gange.");
-                break; // Forlad while-loopet
+                break;
             }
             delay(5000);
         }
@@ -407,7 +402,7 @@ void resetAP() {
 void goToSleep() {
     if (digitalRead(SENSOR1_PIN) == HIGH) {
         Serial.println("Motion sensor aktiv. Afventer.");
-        return; // Hvis sensoren allerede er aktiv, vent med at gå i sleep
+        return; 
     }
 
     Serial.println("Ingen aktivitet. Går i deep sleep...");
