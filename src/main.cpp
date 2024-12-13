@@ -6,52 +6,59 @@
 #include <PubSubClient.h>
 #include "driver/rtc_io.h" // For RTC_DATA_ATTR
 
-
-// Motion sensor pins
-#define SENSOR1_PIN 33
-#define LED_PIN 2 
+// Definer pins til bevægelsessensor og LED
+#define SENSOR1_PIN 33 // Pin til bevægelsessensor
+#define LED_PIN 2 // Pin til LED
 
 #define uS_TO_S_FACTOR 1000000ULL // Mikrosekunder til sekunder
-#define SLEEP_DURATION 1 // Sleep varighed i sekunder (1 minut)
+#define SLEEP_DURATION 1 // Deep sleep-varighed i sekunder
 
-/// MQTT-broker parameters
-const char *mqttBroker = "broker.hivemq.com";
-const int mqttPort = 1883;
-const char* mqttTopic = "plates/detected";
-const char *mqtt_client_id = "ds18b20"; 
-bool mqttNotActive = false;
+// MQTT-parametre
+const char *mqttBroker = "broker.hivemq.com"; // MQTT-brokeradresse
+const int mqttPort = 1883; // MQTT-port
+const char* mqttTopic = "plates/detected"; // MQTT-emne
+const char *mqtt_client_id = "ds18b20"; // MQTT-klient-id
+bool mqttNotActive = false; // Indikator for MQTT-status
 
+// Initialiser WiFi og MQTT-klient
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-// Debounce timing
-volatile unsigned long lastInterruptTime1 = 0;
-const unsigned long debounceDelay = 5000; // 5 seconds
+// Debounce-parametre
+volatile unsigned long lastInterruptTime1 = 0; // Tidspunkt for sidste interrupt
+const unsigned long debounceDelay = 5000; // Debounce-tid i millisekunder
 
-// Last motion time
-#define INACTIVITY_TIMEOUT 30000 // 30 sekunder i millisekunder
-unsigned long lastMotionTime = 0;
-unsigned long lastMQTTRetryTime = 0;
+// Variabler til inaktivitet
+#define INACTIVITY_TIMEOUT 10000 // Timeout i millisekunder
+RTC_DATA_ATTR unsigned long lastMotionTime = 0; // Sidste bevægelsestid, gemt gennem deep sleep
+unsigned long lastMQTTRetryTime = 0; // Tidspunkt for sidste MQTT-forsøg
 
-// Web server on port 80
+// Webserver konfigureret til port 80
 AsyncWebServer server(80);
 
-// Parameters for Wi-Fi Credentials path in LittleFS
-const char *ssidPath = "/ssid.txt";
-const char *passPath = "/pass.txt";
-const char *dataPath = "/data.txt";
+// Filer i LittleFS til gemte data
+const char *ssidPath = "/ssid.txt"; // Filsti til WiFi-SSID
+const char *passPath = "/pass.txt"; // Filsti til WiFi-password
+const char *dataPath = "/data.txt"; // Filsti til gemt data
 
-// Parameters for Wi-Fi Credentials
-const char *PARAM_INPUT_1 = "ssid";
-const char *PARAM_INPUT_2 = "password";
+// WiFi-parameternavne
+const char *PARAM_INPUT_1 = "ssid"; // SSID-parameternavn
+const char *PARAM_INPUT_2 = "password"; // Password-parameternavn
 
-String ssid;
-String pass;
-String data;
+// Variabler til WiFi-data
+String ssid; // Gemt SSID
+String pass; // Gemt password
+String data; // Gemt data
 
-RTC_DATA_ATTR bool triggerAPMode = false;
+// Tidservere
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 3600; // Justér for din tidszone (GMT+1)
+const int daylightOffset_sec = 3600; // Sommer-/vintertid
 
-// Function Prototypes
+// Variabel til AP-mode status
+RTC_DATA_ATTR bool triggerAPMode = false; // Indikator for AP-mode
+
+// Funktionsprototyper
 void IRAM_ATTR handleMotionSensor1();
 void processPlate();
 void initLittleFS();
@@ -67,102 +74,145 @@ void goToSleep();
 void sendSavedData();
 void appendFile(fs::FS &fs, const char *path, const char *message);
 void handleMQTTConnectionStatus();
+void setupRTC();
 
+RTC_DATA_ATTR bool motionDetected = false; // Bevægelsesindikator gemt gennem deep sleep
 
-volatile bool motionDetected = false;
-
-
+// Setup-funktion initialiserer systemet
 void setup() {
     Serial.begin(115200);
     Serial.println("Starter ESP32...");
 
+    // Initialiser filsystemet
     initLittleFS();
 
+    // Læs gemte WiFi-oplysninger fra LittleFS
     ssid = readFile(LittleFS, ssidPath);
     pass = readFile(LittleFS, passPath);
     data = readFile(LittleFS, dataPath);
 
-    // Initialize motion sensor
-    pinMode(SENSOR1_PIN, INPUT_PULLDOWN);
-    pinMode(LED_PIN, OUTPUT);
-    attachInterrupt(digitalPinToInterrupt(SENSOR1_PIN), handleMotionSensor1, RISING);
+    // Konfigurer bevægelsessensor og LED
+    pinMode(SENSOR1_PIN, INPUT_PULLDOWN); // Sensor som input
+    pinMode(LED_PIN, OUTPUT); // LED som output
+    attachInterrupt(digitalPinToInterrupt(SENSOR1_PIN), handleMotionSensor1, RISING); // Interrupt for bevægelse
 
-    // Initialize WiFi
+    // Tilslut WiFi eller start AP-mode
     if (!initWiFi()) {
         setupWiFi();
     }
 
-    // Initialize MQTT
+    // Initialiser RTC
+    setupRTC();
+
+    // Konfigurer MQTT
     mqttClient.setServer(mqttBroker, mqttPort);
 
-    lastMotionTime = millis();
+    // Check sensorstatus ved opstart
+    if (digitalRead(SENSOR1_PIN) == HIGH) {
+        Serial.println("Sensor aktiv ved opstart.");
+        motionDetected = true; // Indstil bevægelsesflag
+    }
+
+    // Sæt sidste bevægelsestid hvis ikke allerede sat
+    if (lastMotionTime == 0) {
+        lastMotionTime = millis();
+    }
 
     Serial.println("Setup færdig.");
 }
 
+// Loop-funktionen kører konstant
 void loop() {
+    // Håndter AP-mode
     if (triggerAPMode) {
         resetAP();
     }
 
+    // Håndter bevægelsesdetektion
     if (motionDetected) {
-        motionDetected = false;
-        processPlate();
-        lastMotionTime = millis();
+        motionDetected = false; // Nulstil bevægelsesflag
+        processPlate(); // Processer pladedata
+        lastMotionTime = millis(); // Opdater sidste bevægelsestid
     }
 
+    // Sæt ESP'en i deep sleep efter inaktivitet
     if ((millis() - lastMotionTime) > INACTIVITY_TIMEOUT) {
         goToSleep();
     }
 
+    // Håndter MQTT-forbindelse
     if (mqttNotActive && (millis() - lastMQTTRetryTime) > 60000) {
+        Serial.println("MQTT er ikke aktiv. Forsøger igen...");
         reconnectMQTT();
         handleMQTTConnectionStatus();
-    }
-    else if (!mqttClient.connected()) {
+    } else if (!mqttClient.connected()) {
         reconnectMQTT();
         handleMQTTConnectionStatus();
     }
 
+    // Tænd/sluk LED baseret på sensorstatus
     int sensorValue = digitalRead(SENSOR1_PIN);
     digitalWrite(LED_PIN, sensorValue ? LOW : HIGH);
 
     delay(100);
 }
 
-void  handleMQTTConnectionStatus() {
-    if (mqttNotActive) {
-        Serial.println("MQTT er ikke aktiv fra loop");
-    }
-    else {
-        Serial.println("MQTT er aktiv fra loop");
-        // Send saved data to MQTT
-        sendSavedData();
-        mqttClient.loop();
+void setupRTC() {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+        Serial.println("RTC initialiseret med NTP-tid:");
+        Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+    } else {
+        Serial.println("Fejl under initialisering af RTC med NTP.");
     }
 }
 
+// Håndter MQTT-status
+void handleMQTTConnectionStatus() {
+    if (mqttNotActive) {
+        Serial.println("MQTT er ikke aktiv.");
+    } else {
+        Serial.println("MQTT er aktiv.");
+        sendSavedData(); // Send gemt data til MQTT
+        mqttClient.loop(); // Hold MQTT-forbindelse aktiv
+    }
+}
+
+// Interrupt-handler for bevægelsessensor
 void IRAM_ATTR handleMotionSensor1() {
     unsigned long currentTime = millis();
     if (currentTime - lastInterruptTime1 > debounceDelay) {
         lastInterruptTime1 = currentTime;
-        motionDetected = true; // Set the flag for motion detection
+        motionDetected = true; // Sæt bevægelsesflag
     }
 }
 
+// Processer pladedata
 void processPlate() {
     Serial.println("Bevægelse registreret. Henter data...");
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+        char timeStr[64];
+        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+        Serial.printf("Pladen blev registreret på: %s\n", timeStr);
+    } else {
+        Serial.println("Fejl under hentning af tid.");
+    }
+
     String plate, timestamp;
     if (queryPlateScanner(plate, timestamp)) {
-        Serial.printf("Valid plade: %s kl. %s\n", plate.c_str(), timestamp.c_str());
-        sendToMQTT(plate, timestamp);
+        Serial.printf("Gyldig plade: %s kl. %s\n", plate.c_str(), timestamp.c_str());
+        sendToMQTT(plate, timestamp); // Send til MQTT
     } else {
-        Serial.println("Ingen valid plade fundet.");
+        Serial.println("Ingen gyldig plade fundet.");
     }
 }
 
+// Forespørg pladescanner for data
 bool queryPlateScanner(String &plate, String &timestamp) {
-    const char *serverUrl = "http://192.168.1.142:5000/get_plate"; // Opdater med din Flask-servers IP
+    const char *serverUrl = "http://192.168.0.185:5000/get_plate"; // Flask-serverens IP
 
     WiFiClient client;
     HTTPClient http;
@@ -170,9 +220,9 @@ bool queryPlateScanner(String &plate, String &timestamp) {
     if (http.begin(client, serverUrl)) {
         int httpCode = http.GET();
 
-        if (httpCode == HTTP_CODE_OK) { // HTTP status 200
+        if (httpCode == HTTP_CODE_OK) { // Tjek om HTTP-status er OK
             String payload = http.getString();
-            Serial.println("Response from server: " + payload);
+            Serial.println("Svar fra server: " + payload);
 
             int commaIndex = payload.indexOf(',');
             if (commaIndex != -1) {
@@ -181,36 +231,40 @@ bool queryPlateScanner(String &plate, String &timestamp) {
                 http.end();
                 return true;
             } else {
-                Serial.println("Invalid format received.");
+                Serial.println("Modtaget format er ugyldigt.");
             }
         } else {
-            Serial.printf("HTTP GET failed with error: %d\n", httpCode);
+            Serial.printf("HTTP GET fejlede med fejl: %d\n", httpCode);
         }
 
         http.end();
     } else {
-        Serial.println("Unable to connect to server.");
+        Serial.println("Kunne ikke forbinde til server.");
     }
 
     return false;
 }
 
+// Send data til MQTT
 void sendToMQTT(const String &plate, const String &timestamp) {
     String message = "{\"plate\":\"" + plate + "\",\"timestamp\":\"" + timestamp + "\"}";
 
-    if (mqttNotActive) {
-        appendFile(LittleFS, dataPath, message.c_str() + String("\n"));
-        Serial.println("MQTT er ikke aktiv. Data gemt lokalt.");
-        return;
-    }
 
     if (mqttClient.publish(mqttTopic, message.c_str())) {
         Serial.println("Data sendt til MQTT: " + message);
     } else {
         Serial.println("Fejl ved at sende data til MQTT.");
+
+        if (mqttNotActive) {
+            String messageWithNewline = message + "\n";
+            appendFile(LittleFS, dataPath, messageWithNewline.c_str());
+            Serial.println("MQTT er ikke aktiv. Data gemt lokalt.");
+            return;
+        }
     }
 }
 
+// Genopret MQTT-forbindelse
 void reconnectMQTT() {
     int retries = 0;
     lastMQTTRetryTime = millis();
@@ -228,7 +282,7 @@ void reconnectMQTT() {
             retries++;
             if (retries > 3) {
                 mqttNotActive = true;
-                Serial.println("MQTT connection fejlede. Vi prøvede 3 gange.");
+                Serial.println("MQTT-tilslutning fejlede. Forsøg opgivet.");
                 break;
             }
             delay(5000);
@@ -236,15 +290,15 @@ void reconnectMQTT() {
     }
 }
 
-
+// Initialiser LittleFS
 void initLittleFS() {
     if (!LittleFS.begin(true)) {
-        Serial.println("Failed to mount LittleFS");
+        Serial.println("Kunne ikke montere LittleFS");
         return;
     }
-    Serial.println("LittleFS mounted successfully");
+    Serial.println("LittleFS monteret succesfuldt.");
 
-    // Create default files if they do not exist
+    // Opret standardfiler hvis de ikke findes
     if (!LittleFS.exists(ssidPath)) {
         writeFile(LittleFS, ssidPath, "");
     }
@@ -256,11 +310,12 @@ void initLittleFS() {
     }
 }
 
+// Læs fil fra LittleFS
 String readFile(fs::FS &fs, const char *path) {
-    Serial.printf("Reading file: %s\n", path);
+    Serial.printf("Læser fil: %s\n", path);
     File file = fs.open(path, "r");
     if (!file) {
-        Serial.println("Failed to open file for reading");
+        Serial.println("Kunne ikke åbne fil til læsning.");
         return String();
     }
     String content = file.readStringUntil('\n');
@@ -268,59 +323,62 @@ String readFile(fs::FS &fs, const char *path) {
     return content;
 }
 
+// Skriv til fil i LittleFS
 void writeFile(fs::FS &fs, const char *path, const char *message) {
-    Serial.printf("Writing file: %s\n", path);
+    Serial.printf("Skriver til fil: %s\n", path);
     File file = fs.open(path, "w");
     if (!file) {
-        Serial.println("Failed to open file for writing");
+        Serial.println("Kunne ikke åbne fil til skrivning.");
         return;
     }
     file.print(message);
     file.close();
 }
 
+// Tilføj til fil i LittleFS
 void appendFile(fs::FS &fs, const char *path, const char *message) {
-    Serial.printf("Appending to file: %s\n", path);
-    File file = fs.open(path, FILE_APPEND); // Åbn filen i append-tilstand
+    Serial.printf("Tilføjer til fil: %s\n", path);
+    File file = fs.open(path, FILE_APPEND);
     if (!file) {
-        Serial.println("Failed to open file for appending");
+        Serial.println("Kunne ikke åbne fil til tilføjelse.");
         return;
     }
-    file.print(message); // Tilføj beskeden til slutningen af filen
+    file.print(message);
     file.close();
-    Serial.println("Message appended successfully");
+    Serial.println("Data tilføjet til fil.");
 }
 
-
+// Initialiser WiFi
 bool initWiFi() {
     if (ssid.isEmpty()) {
-        Serial.println("Undefined SSID");
+        Serial.println("SSID ikke defineret.");
         return false;
     }
 
     WiFi.begin(ssid.c_str(), pass.c_str());
-    Serial.println("Connecting to Wi-Fi...");
+    Serial.println("Forbinder til WiFi...");
 
     unsigned long startAttemptTime = millis();
 
     while (WiFi.status() != WL_CONNECTED) {
         if (millis() - startAttemptTime > 10000) {
-            Serial.println("Failed to connect to Wi-Fi");
+            Serial.println("Kunne ikke oprette forbindelse til WiFi.");
             return false;
         }
         delay(500);
         Serial.print(".");
     }
 
-    Serial.println("\nConnected to Wi-Fi");
+    Serial.println("\nForbundet til WiFi.");
     Serial.println(WiFi.localIP());
     return true;
 }
 
+// Konfigurer AP-mode
 void setupWiFi() {
     WiFi.softAP("ESP-WIFI-MANAGER");
     IPAddress IP = WiFi.softAPIP();
-    Serial.print("AP IP address: ");
+    Serial.print("AP IP-adresse: ");
     Serial.println(IP);
 
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -339,7 +397,7 @@ void setupWiFi() {
                 writeFile(LittleFS, passPath, pass.c_str());
             }
         }
-        request->send(200, "text/plain", "Saved. Restarting...");
+        request->send(200, "text/plain", "Gemte oplysninger. Genstarter...");
         delay(1000);
         ESP.restart();
     });
@@ -347,51 +405,51 @@ void setupWiFi() {
     server.begin();
 }
 
+// Send gemt data til MQTT
 void sendSavedData() {
-    Serial.println("Sending saved data to MQTT...");
+    Serial.println("Sender gemt data til MQTT...");
 
     if (WiFi.status() == WL_CONNECTED && mqttClient.connected()) {
         File file = LittleFS.open(dataPath, FILE_READ);
 
         if (!file || file.size() == 0) {
-            Serial.println("No saved data to send.");
+            Serial.println("Ingen gemt data at sende.");
             return;
         }
 
-        String remainingData = ""; // Bruges til at gemme data, der ikke blev sendt korrekt
+        String remainingData = "";
 
         while (file.available()) {
-            String line = file.readStringUntil('\n'); // Læs en linje
-            line.trim(); // Fjern evt. whitespaces
+            String line = file.readStringUntil('\n');
+            line.trim();
 
             if (line.isEmpty()) {
-                continue; // Ignorer tomme linjer
+                continue;
             }
 
             if (mqttClient.publish(mqttTopic, line.c_str())) {
-                Serial.println("Data sent to MQTT: " + line);
+                Serial.println("Data sendt til MQTT: " + line);
             } else {
-                Serial.println("Failed to send data to MQTT. Storing for retry.");
-                remainingData += line + "\n"; // Gem linjen til genforsøg
+                Serial.println("Fejl ved at sende data til MQTT. Gemmer til senere.");
+                remainingData += line + "\n";
             }
         }
 
         file.close();
 
-        // Overskriv filen med kun de linjer, der ikke blev sendt korrekt
         File writeFile = LittleFS.open(dataPath, FILE_WRITE);
         if (writeFile) {
             writeFile.print(remainingData);
             writeFile.close();
         } else {
-            Serial.println("Failed to update saved data file.");
+            Serial.println("Kunne ikke opdatere gemt data.");
         }
     } else {
-        Serial.println("MQTT or WiFi not connected. Cannot send saved data.");
+        Serial.println("WiFi eller MQTT ikke forbundet. Kunne ikke sende data.");
     }
 }
 
-
+// Gendan til AP-mode
 void resetAP() {
     triggerAPMode = false;
     LittleFS.remove(ssidPath);
@@ -399,13 +457,14 @@ void resetAP() {
     ESP.restart();
 }
 
+// Sæt ESP'en i deep sleep
 void goToSleep() {
     if (digitalRead(SENSOR1_PIN) == HIGH) {
-        Serial.println("Motion sensor aktiv. Afventer.");
-        return; 
+        Serial.println("Bevægelsessensor aktiv. Afventer.");
+        return;
     }
 
     Serial.println("Ingen aktivitet. Går i deep sleep...");
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_33, 1); // Wake-up på HIGH signal
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_33, 1); // Wake-up ved HIGH signal
     esp_deep_sleep_start();
 }

@@ -8,7 +8,7 @@ if defined _OLD_CODEPAGE (
     "%SystemRoot%\System32\chcp.com" 65001 > nul
 )
 
-set VIRTUAL_ENV=C:\Users\lucas\Documents\Github\H4iot2AfsluttendeOpgave\subscriber_py\venv
+set VIRTUAL_ENV=C:\Users\lucas\Documents\GitHub\H4iot2AfsluttendeOpgave\subscriber_py\venv
 
 if not defined PROMPT set PROMPT=$P$G
 
